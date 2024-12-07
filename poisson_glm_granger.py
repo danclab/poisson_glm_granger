@@ -3,6 +3,7 @@ from sklearn.metrics import log_loss
 from joblib import Parallel, delayed
 import numpy as np
 from statsmodels.api import GLM, families
+from statsmodels.stats.multitest import multipletests
 
 def cross_validate_window(source, target, data, lag, folds=5):
     """
@@ -97,8 +98,7 @@ def compute_optimal_windows(data, window_range=(1, 10), folds=5, n_jobs=-1):
     return results
 
 
-def compute_granger_causality(data, window_range=(1, 20), folds=10, n_jobs=-1, pairwise_windows=None,
-                              gc_type='conditional'):
+def compute_granger_causality(data, window_range=(1, 20), folds=10, n_jobs=-1, pairwise_windows=None):
     """
     Compute Granger causality matrix using pair-specific optimal windows.
 
@@ -117,9 +117,6 @@ def compute_granger_causality(data, window_range=(1, 20), folds=10, n_jobs=-1, p
         A dictionary with keys `(source, target)` and values as the optimal window size
         for that pair, as returned by `compute_optimal_windows`. If None, this will be
         recomputed by calling compute_optimal_windows
-    gc_type : str, optional
-        Type of Granger causality to compute: "conditional" or "partial".
-        Default is "conditional".
 
     Returns:
     -------
@@ -145,7 +142,7 @@ def compute_granger_causality(data, window_range=(1, 20), folds=10, n_jobs=-1, p
 
     # Parallel computation for each source-target pair
     gc_results = Parallel(n_jobs=n_jobs)(
-        delayed(compute_gc_for_pair)(data, source, target, pairwise_windows[(source, target)][0], gc_type=gc_type)
+        delayed(compute_gc_for_pair)(data, source, target, pairwise_windows[(source, target)][0])
         for target in range(neurons)
         for source in range(neurons)
     )
@@ -161,7 +158,88 @@ def compute_granger_causality(data, window_range=(1, 20), folds=10, n_jobs=-1, p
     return pairwise_windows, gc_matrix, signed_gc_matrix
 
 
-def compute_gc_for_pair(data, source, target, lag, gc_type="conditional"):
+def filter_indirect_connections(data, best_windows, gc_matrix, signed_gc_matrix, dominance_threshold=0.5, uniqueness_threshold=0.1):
+    """
+    Filter out indirect influences from the Granger causality matrix.
+
+    Parameters:
+    ----------
+    data : ndarray
+        3D array of shape (neurons, trials, time_steps) representing spike train data.
+    best_windows : dict
+        Optimal window sizes for each pair as computed by `compute_optimal_windows`.
+    gc_matrix : ndarray
+        The original Granger causality matrix.
+    signed_gc_matrix : ndarray
+        The signed Granger causality matrix.
+    dominance_threshold : float, optional
+        Fraction of GC that must be explained by indirect paths to warrant filtering. Default is 0.5.
+    uniqueness_threshold : float, optional
+        Minimum fraction of direct GC that must remain unique after accounting for indirect contributions. Default is 0.1.
+
+    Returns:
+    -------
+    filtered_gc_matrix : ndarray
+        GC matrix with indirect influences adjusted.
+    filtered_signed_gc_matrix : ndarray
+        Signed GC matrix with indirect influences adjusted.
+    """
+    neurons = data.shape[0]
+    filtered_gc_matrix = gc_matrix.copy()
+    filtered_signed_gc_matrix = signed_gc_matrix.copy()
+
+    for target in range(neurons):
+        for source in range(neurons):
+            if source == target:
+                continue
+
+            # Direct GC for the source-target pair
+            direct_window = best_windows[(source, target)][0]
+            direct_gc = gc_matrix[source, target]
+            direct_signed_gc = signed_gc_matrix[source, target]
+
+            # Accumulate indirect contributions
+            total_indirect_gc = 0
+            total_indirect_signed_gc = 0
+            for intermediate in range(neurons):
+                if intermediate == source or intermediate == target:
+                    continue
+
+                # Intermediate path windows
+                source_to_intermediate_window = best_windows[(source, intermediate)][0]
+                intermediate_to_target_window = best_windows[(intermediate, target)][0]
+
+                # Validate temporal alignment for indirect paths
+                if source_to_intermediate_window + intermediate_to_target_window == direct_window:
+                    indirect_gc = gc_matrix[source, intermediate] * gc_matrix[intermediate, target]
+                    indirect_signed_gc = (
+                        signed_gc_matrix[source, intermediate] * signed_gc_matrix[intermediate, target]
+                    )
+                    total_indirect_gc += indirect_gc
+                    total_indirect_signed_gc += indirect_signed_gc
+
+            # Calculate the fraction of direct GC explained by indirect paths
+            indirect_fraction = total_indirect_gc / (direct_gc + 1e-10)  # Prevent division by zero
+
+            # Apply filtering logic
+            if indirect_fraction >= dominance_threshold:
+                remaining_gc = direct_gc - total_indirect_gc
+                if remaining_gc < uniqueness_threshold * direct_gc:
+                    # Fully filter if little unique GC remains
+                    filtered_gc_matrix[source, target] = 0
+                    filtered_signed_gc_matrix[source, target] = 0
+                else:
+                    # Otherwise, adjust the direct GC to reflect unique contribution
+                    filtered_gc_matrix[source, target] = remaining_gc
+                    filtered_signed_gc_matrix[source, target] = direct_signed_gc - total_indirect_signed_gc
+
+    return filtered_gc_matrix, filtered_signed_gc_matrix
+
+
+
+
+
+def compute_gc_for_pair(data, source, target, lag):
     """
     Compute Granger causality score (conditional or partial) for a source-target pair.
 
@@ -175,9 +253,6 @@ def compute_gc_for_pair(data, source, target, lag, gc_type="conditional"):
         Index of the target neuron.
     lag : int
         The specific lag (time step) to use for causality computation.
-    gc_type : str, optional
-        Type of Granger causality to compute: "conditional" or "partial".
-        Default is "conditional".
 
     Returns:
     -------
@@ -208,25 +283,9 @@ def compute_gc_for_pair(data, source, target, lag, gc_type="conditional"):
     reduced_model = GLM(target_spikes, predictors_reduced, family=families.Poisson()).fit()
 
     # Conditional Granger causality
-    if gc_type == "conditional":
-        ll_full = full_model.llf
-        ll_reduced = reduced_model.llf
-        gc = 2 * (ll_full - ll_reduced)
-    elif gc_type == "partial":
-        # Conditional model: source + intercept only
-        predictors_conditional = np.column_stack([np.ones_like(lagged_source), lagged_source])
-        conditional_model = GLM(target_spikes, predictors_conditional, family=families.Poisson()).fit()
-
-        # Compute likelihood ratios
-        ll_full = full_model.llf
-        ll_reduced = reduced_model.llf
-        ll_conditional = conditional_model.llf
-
-        # Compute Partial GC: full - (reduced - conditional)
-        gc_full = 2 * (ll_full - ll_reduced)
-        gc = gc_full - 2 * (ll_reduced - ll_conditional)
-    else:
-        raise ValueError(f"Invalid gc_type: {gc_type}. Must be 'conditional' or 'partial'.")
+    ll_full = full_model.llf
+    ll_reduced = reduced_model.llf
+    gc = 2 * (ll_full - ll_reduced)
 
     # Determine interaction sign
     source_coeff = full_model.params[1]
@@ -237,9 +296,9 @@ def compute_gc_for_pair(data, source, target, lag, gc_type="conditional"):
 
 
 def permutation_test(best_windows, gc_matrix, signed_gc_matrix, data, n_permutations=1000,
-                     gc_type='conditional', n_jobs=-1):
+                     gc_type='conditional', n_jobs=-1, alpha=0.05):
     """
-    Perform a one-tailed permutation test for signed Granger causality analysis.
+    Perform a one-tailed permutation test for signed Granger causality analysis with FDR correction.
 
     Parameters:
     ----------
@@ -251,18 +310,17 @@ def permutation_test(best_windows, gc_matrix, signed_gc_matrix, data, n_permutat
         3D array of shape (neurons, trials, time_steps) representing spike train data.
     n_permutations : int, optional
         Number of permutations to perform for the test. Default is 1000.
-    gc_type : str, optional
-        Type of Granger causality to compute: "conditional" or "partial".
-        Default is "conditional".
     n_jobs : int, optional
         Number of parallel jobs for the computation. Default is -1.
+    alpha : float, optional
+        Significance level for FDR correction. Default is 0.05.
 
     Returns:
     -------
     ndarray
-        Significance-thresholded signed Granger causality matrix.
+        FDR-corrected significant signed Granger causality matrix.
     ndarray
-        P-values for each connection.
+        Adjusted p-values for each connection after FDR correction.
     ndarray
         Null distributions for all connections.
     """
@@ -280,7 +338,7 @@ def permutation_test(best_windows, gc_matrix, signed_gc_matrix, data, n_permutat
         target : int
             Target neuron index.
         lag : int
-            Optimal lag for this source-target pair.
+            Optimal lag for this pair.
         perm_idx : int
             Permutation index (unused, required for parallel execution).
 
@@ -289,36 +347,42 @@ def permutation_test(best_windows, gc_matrix, signed_gc_matrix, data, n_permutat
         float
             Permuted signed GC value for the source-target pair.
         """
-        # Shuffle source neuron spikes
         shuffled_data = data.copy()
         trials = shuffled_data.shape[1]
-        for trial in range(trials):
-            np.random.shuffle(shuffled_data[source, trial, :])  # Shuffle only the source neuron spikes
+        if source == target:
+            for trial in range(trials):
+                np.random.shuffle(shuffled_data[source, trial, :])
+        else:
+            permuted_trials = np.random.permutation(trials)
+            shuffled_data[source, :, :] = shuffled_data[source, permuted_trials, :]
 
-        # Recompute GC for the shuffled data
-        return compute_gc_for_pair(shuffled_data, source, target, lag, gc_type=gc_type)[0]
+        return compute_gc_for_pair(shuffled_data, source, target, lag)[0]
 
     # Parallel computation of permuted GC matrices
     for target in range(neurons):
         for source in range(neurons):
-            lag = best_windows[(source, target)][0]  # Optimal lag for this pair
+            lag = best_windows[(source, target)][0]
             permuted_gc_values = Parallel(n_jobs=n_jobs)(
                 delayed(compute_permuted_gc)(source, target, lag, perm)
                 for perm in range(n_permutations)
             )
             permuted_gc_matrices[:, source, target] = permuted_gc_values
 
-    # Compute p-values
+    # Compute raw p-values
     p_values = np.zeros_like(gc_matrix)
     for i in range(neurons):
         for j in range(neurons):
             observed_value = gc_matrix[i, j]
             null_values = permuted_gc_matrices[:, i, j]
-            # One-tailed test for positive GC
             p_values[i, j] = (np.sum(null_values >= observed_value) + 1) / (n_permutations + 1)
 
-    # Apply significance threshold (e.g., p < 0.05)
-    alpha = 0.001
-    significant_gc_matrix = np.where(p_values < alpha, signed_gc_matrix, 0)
+    # FDR correction
+    flattened_p_values = p_values.flatten()
+    _, corrected_p_values, _, _ = multipletests(flattened_p_values, alpha=alpha, method='fdr_bh')
+    corrected_p_values = corrected_p_values.reshape(p_values.shape)
 
-    return significant_gc_matrix, p_values, permuted_gc_matrices
+    # Apply FDR threshold to determine significance
+    significant_gc_matrix = np.where(corrected_p_values < alpha, signed_gc_matrix, 0)
+
+    return significant_gc_matrix, corrected_p_values, permuted_gc_matrices
+
