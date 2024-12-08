@@ -296,7 +296,7 @@ def compute_gc_for_pair(data, source, target, lag):
 
 
 def permutation_test(best_windows, gc_matrix, signed_gc_matrix, data, n_permutations=1000,
-                     gc_type='conditional', n_jobs=-1, alpha=0.05):
+                     n_jobs=-1, alpha=0.05):
     """
     Perform a one-tailed permutation test for signed Granger causality analysis with FDR correction.
 
