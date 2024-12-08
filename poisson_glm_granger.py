@@ -128,6 +128,7 @@ def compute_granger_causality(data, window_range=(1, 20), folds=10, n_jobs=-1, p
         the causality score from one neuron to another.
     """
     neurons, trials, time_steps = data.shape
+    print(f'Data contains {neurons} neurons, {trials} trials, and {time_steps} time steps.')
 
     if pairwise_windows is None:
         pairwise_windows = compute_optimal_windows(
