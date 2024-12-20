@@ -4,6 +4,9 @@ from joblib import Parallel, delayed
 import numpy as np
 from statsmodels.api import GLM, families
 from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tools import add_constant
+
 
 def cross_validate_lag(source, target, data, lag, folds=10):
     """
@@ -58,10 +61,9 @@ def cross_validate_lag(source, target, data, lag, folds=10):
     return avg_log_likelihood / folds
 
 
-
 def compute_optimal_lags(data, lag_range=(1, 20), folds=10, n_jobs=-1):
     """
-    Compute the optimal history lag for each source-target pair.
+    Compute the optimal history lag for each source-target pair with enhanced parallelization.
 
     Parameters:
     ----------
@@ -81,25 +83,36 @@ def compute_optimal_lags(data, lag_range=(1, 20), folds=10, n_jobs=-1):
         (optimal lag, cross-validated score).
     """
     neurons, _, _ = data.shape
-    results = {}
 
-    for target in range(neurons):
-        for source in range(neurons):
-            scores = Parallel(n_jobs=n_jobs)(
-                delayed(cross_validate_lag)(source, target, data, lag, folds)
-                for lag in range(lag_range[0], lag_range[1] + 1)
-            )
+    # Define a helper function to compute the score for a specific (source, target, lag) tuple
+    def compute_score_for_lag(source, target):
+        scores = [
+            cross_validate_lag(source, target, data, lag, folds)
+            for lag in range(lag_range[0], lag_range[1] + 1)
+        ]
+        best_cv_score = max(scores)
+        best_lag = lag_range[0] + scores.index(best_cv_score)
+        return (source, target, best_lag, best_cv_score)
 
-            best_cv_score = max(scores)
-            best_lag = lag_range[0] + scores.index(best_cv_score)
-            results[(source, target)] = (best_lag, best_cv_score)
+    # Generate all (source, target) pairs
+    source_target_pairs = [(source, target) for source in range(neurons) for target in range(neurons)]
 
-            print(f"{source}->{target}: Optimal lag = {best_lag}, CV score = {best_cv_score:.4f}")
+    # Parallel computation
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(compute_score_for_lag)(source, target)
+        for source, target in source_target_pairs
+    )
 
-    return results
+    # Format results into a dictionary
+    results_dict = {(source, target): (best_lag, best_cv_score) for source, target, best_lag, best_cv_score in results}
+
+    #for (source, target), (best_lag, best_cv_score) in results_dict.items():
+    #    print(f"{source}->{target}: Optimal lag = {best_lag}, CV score = {best_cv_score:.4f}")
+
+    return results_dict
 
 
-def compute_gc_for_pair(data, source, target, lag):
+def compute_gc_for_pair(data, source, target, lag, remove_redundant=True):
     """
     Compute Granger causality score (conditional or partial) for a source-target pair.
 
@@ -113,6 +126,8 @@ def compute_gc_for_pair(data, source, target, lag):
         Index of the target neuron.
     lag : int
         The specific lag (time step) to use for causality computation.
+    remove_redundant : bool
+        Whether or not to remove redundant predictors (Default: True)
 
     Returns:
     -------
@@ -133,29 +148,57 @@ def compute_gc_for_pair(data, source, target, lag):
 
     # Full model: source + other neurons
     lagged_source = data[source, :, lag - lag:time_steps - lag].reshape(-1)
-    predictors_full = np.column_stack([np.ones_like(lagged_source), lagged_source] + conditional_predictors)
 
-    # Reduced model: other neurons only
-    predictors_reduced = np.column_stack([np.ones_like(lagged_source)] + conditional_predictors)
+    gc = 0
+    signed_gc = 0
+    if not np.all(lagged_source == 0) or np.all(target_spikes == 0):
+        # Combine predictors
+        conditional_predictors = np.column_stack(conditional_predictors)
 
-    # Fit full and reduced models
-    full_model = GLM(target_spikes, predictors_full, family=families.Poisson()).fit()
-    reduced_model = GLM(target_spikes, predictors_reduced, family=families.Poisson()).fit()
+        # Remove redundant predictors from conditional_predictors based on VIF
+        if remove_redundant:
+            def remove_redundant_predictors(predictors):
+                predictors = add_constant(predictors, has_constant="add")
+                vif = [variance_inflation_factor(predictors, i) for i in range(predictors.shape[1])]
+                while max(vif[1:]) > 10:  # Ignore the intercept (index 0)
+                    max_vif_index = 1 + np.argmax(vif[1:])  # Adjust for intercept
+                    predictors = np.delete(predictors, max_vif_index, axis=1)
+                    vif = [variance_inflation_factor(predictors, i) for i in range(predictors.shape[1])]
+                return predictors[:, 1:]  # Remove the intercept before returning
 
-    # Conditional Granger causality
-    ll_full = full_model.llf
-    ll_reduced = reduced_model.llf
-    gc = 2 * (ll_full - ll_reduced)
+            conditional_predictors = remove_redundant_predictors(conditional_predictors)
 
-    # Determine interaction sign
-    source_coeff = full_model.params[1]
-    interaction_sign = np.sign(source_coeff)
+        predictors_full = np.column_stack([np.ones_like(lagged_source), lagged_source, conditional_predictors])
+        predictors_reduced = np.column_stack([np.ones_like(lagged_source), conditional_predictors])
 
-    signed_gc = np.abs(gc) * interaction_sign
+        # Remove columns with all zeros
+        predictors_full = predictors_full[:, ~np.all(predictors_full == 0, axis=0)]
+        predictors_reduced = predictors_reduced[:, ~np.all(predictors_reduced == 0, axis=0)]
+
+        # Fit full and reduced models
+        try:
+            full_model = GLM(target_spikes, predictors_full, family=families.Poisson()).fit()
+            reduced_model = GLM(target_spikes, predictors_reduced, family=families.Poisson()).fit()
+
+            # Conditional Granger causality
+            ll_full = full_model.llf
+            ll_reduced = reduced_model.llf
+            gc = 2 * (ll_full - ll_reduced)
+
+            # Determine interaction sign
+            source_coeff = full_model.params[1]
+            interaction_sign = np.sign(source_coeff)
+
+            signed_gc = np.abs(gc) * interaction_sign
+        except Exception as e:
+            print(f"Error fitting from {source} to {target} at lag {lag}: {str(e)}")
+            raise ValueError("Error fitting GLM")
+
     return gc, signed_gc
 
 
-def compute_granger_causality(data, lag_range=(1, 20), folds=10, n_jobs=-1, pairwise_lags=None):
+def compute_granger_causality(data, lag_range=(1, 20), folds=10, n_jobs=-1, pairwise_lags=None,
+                              remove_redundant=True):
     """
     Compute Granger causality
 
@@ -174,6 +217,8 @@ def compute_granger_causality(data, lag_range=(1, 20), folds=10, n_jobs=-1, pair
         A dictionary with keys `(source, target)` and values as the optimal lag
         for that pair, as returned by `compute_optimal_lags`. If None, this will be
         recomputed by calling compute_optimal_lags
+    remove_redundant : bool
+        Whether or not to remove redundant predictors (Default: True)
 
     Returns:
     -------
@@ -200,7 +245,7 @@ def compute_granger_causality(data, lag_range=(1, 20), folds=10, n_jobs=-1, pair
 
     # Parallel computation for each source-target pair
     gc_results = Parallel(n_jobs=n_jobs)(
-        delayed(compute_gc_for_pair)(data, source, target, pairwise_lags[(source, target)][0])
+        delayed(compute_gc_for_pair)(data, source, target, pairwise_lags[(source, target)][0], remove_redundant=remove_redundant)
         for target in range(neurons)
         for source in range(neurons)
     )
