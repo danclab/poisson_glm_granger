@@ -4,8 +4,6 @@ from joblib import Parallel, delayed
 import numpy as np
 from statsmodels.api import GLM, families
 from statsmodels.stats.multitest import multipletests
-from statsmodels.stats.outliers_influence import variance_inflation_factor
-from statsmodels.tools import add_constant
 
 
 def cross_validate_lag(source, target, data, lag, folds=10):
@@ -51,8 +49,8 @@ def cross_validate_lag(source, target, data, lag, folds=10):
         predictors_test = np.column_stack([np.ones_like(test_lagged), test_lagged])
 
         # Fit the Poisson GLM
-        model = GLM(target_train, predictors_train, family=families.Poisson())
-        results = model.fit()
+        model = GLM(target_train, predictors_train, family=families.NegativeBinomial(alpha=1.0))
+        results = model.fit(method="lbfgs")
 
         # Compute log-loss
         predicted_probs = results.predict(predictors_test)
@@ -61,7 +59,7 @@ def cross_validate_lag(source, target, data, lag, folds=10):
     return avg_log_likelihood / folds
 
 
-def compute_optimal_lags(data, lag_range=(1, 20), folds=10, n_jobs=-1):
+def compute_optimal_lags(data, lags=None, folds=10, n_jobs=-1):
     """
     Compute the optimal history lag for each source-target pair with enhanced parallelization.
 
@@ -69,8 +67,8 @@ def compute_optimal_lags(data, lag_range=(1, 20), folds=10, n_jobs=-1):
     ----------
     data : ndarray
         3D array of shape (neurons, trials, time_steps) representing spike train data.
-    lag_range : tuple of int, optional
-        The range of history lags to evaluate (inclusive). Default is (1, 20).
+    lags : list of int, optional
+        The list of history lags to evaluate. Default is [].
     folds : int, optional
         The number of folds to use for K-fold cross-validation. Default is 10.
     n_jobs : int, optional
@@ -82,16 +80,19 @@ def compute_optimal_lags(data, lag_range=(1, 20), folds=10, n_jobs=-1):
         A dictionary with keys `(source, target)` and values as a tuple:
         (optimal lag, cross-validated score).
     """
+    if lags is None:
+        lags = []
     neurons, _, _ = data.shape
 
     # Define a helper function to compute the score for a specific (source, target, lag) tuple
     def compute_score_for_lag(source, target):
         scores = [
             cross_validate_lag(source, target, data, lag, folds)
-            for lag in range(lag_range[0], lag_range[1] + 1)
+            for lag in lags
         ]
-        best_cv_score = max(scores)
-        best_lag = lag_range[0] + scores.index(best_cv_score)
+        best_idx = np.argmax(scores)
+        best_cv_score = scores[best_idx]
+        best_lag = lags[best_idx]
         return (source, target, best_lag, best_cv_score)
 
     # Generate all (source, target) pairs
@@ -106,13 +107,10 @@ def compute_optimal_lags(data, lag_range=(1, 20), folds=10, n_jobs=-1):
     # Format results into a dictionary
     results_dict = {(source, target): (best_lag, best_cv_score) for source, target, best_lag, best_cv_score in results}
 
-    #for (source, target), (best_lag, best_cv_score) in results_dict.items():
-    #    print(f"{source}->{target}: Optimal lag = {best_lag}, CV score = {best_cv_score:.4f}")
-
     return results_dict
 
 
-def compute_gc_for_pair(data, source, target, lag, remove_redundant=True):
+def compute_gc_for_pair(data, source, target, lag):
     """
     Compute Granger causality score (conditional or partial) for a source-target pair.
 
@@ -126,8 +124,6 @@ def compute_gc_for_pair(data, source, target, lag, remove_redundant=True):
         Index of the target neuron.
     lag : int
         The specific lag (time step) to use for causality computation.
-    remove_redundant : bool
-        Whether or not to remove redundant predictors (Default: True)
 
     Returns:
     -------
@@ -155,19 +151,6 @@ def compute_gc_for_pair(data, source, target, lag, remove_redundant=True):
         # Combine predictors
         conditional_predictors = np.column_stack(conditional_predictors)
 
-        # Remove redundant predictors from conditional_predictors based on VIF
-        if remove_redundant:
-            def remove_redundant_predictors(predictors):
-                predictors = add_constant(predictors, has_constant="add")
-                vif = [variance_inflation_factor(predictors, i) for i in range(predictors.shape[1])]
-                while max(vif[1:]) > 10:  # Ignore the intercept (index 0)
-                    max_vif_index = 1 + np.argmax(vif[1:])  # Adjust for intercept
-                    predictors = np.delete(predictors, max_vif_index, axis=1)
-                    vif = [variance_inflation_factor(predictors, i) for i in range(predictors.shape[1])]
-                return predictors[:, 1:]  # Remove the intercept before returning
-
-            conditional_predictors = remove_redundant_predictors(conditional_predictors)
-
         predictors_full = np.column_stack([np.ones_like(lagged_source), lagged_source, conditional_predictors])
         predictors_reduced = np.column_stack([np.ones_like(lagged_source), conditional_predictors])
 
@@ -177,8 +160,8 @@ def compute_gc_for_pair(data, source, target, lag, remove_redundant=True):
 
         # Fit full and reduced models
         try:
-            full_model = GLM(target_spikes, predictors_full, family=families.Poisson()).fit()
-            reduced_model = GLM(target_spikes, predictors_reduced, family=families.Poisson()).fit()
+            full_model = GLM(target_spikes, predictors_full, family=families.NegativeBinomial(alpha=1.0)).fit(method="lbfgs")
+            reduced_model = GLM(target_spikes, predictors_reduced, family=families.NegativeBinomial(alpha=1.0)).fit(method="lbfgs")
 
             # Conditional Granger causality
             ll_full = full_model.llf
@@ -192,13 +175,11 @@ def compute_gc_for_pair(data, source, target, lag, remove_redundant=True):
             signed_gc = np.abs(gc) * interaction_sign
         except Exception as e:
             print(f"Error fitting from {source} to {target} at lag {lag}: {str(e)}")
-            raise ValueError("Error fitting GLM")
+            raise ValueError("stop")
 
     return gc, signed_gc
 
-
-def compute_granger_causality(data, lag_range=(1, 20), folds=10, n_jobs=-1, pairwise_lags=None,
-                              remove_redundant=True):
+def compute_granger_causality(data, lags=None, folds=10, n_jobs=-1, pairwise_lags=None):
     """
     Compute Granger causality
 
@@ -206,8 +187,8 @@ def compute_granger_causality(data, lag_range=(1, 20), folds=10, n_jobs=-1, pair
     ----------
     data : ndarray
         3D array of shape (neurons, trials, time_steps) representing spike train data.
-    lag_range : tuple of int, optional
-        The range of history lags to evaluate (inclusive). Default is (1, 20).
+    lags : list of int, optional
+        The list of history lags to evaluate. Default is [].
     folds : int, optional
         The number of folds to use for K-fold cross-validation to determine optimal history
         lags. Default is 10.
@@ -217,8 +198,6 @@ def compute_granger_causality(data, lag_range=(1, 20), folds=10, n_jobs=-1, pair
         A dictionary with keys `(source, target)` and values as the optimal lag
         for that pair, as returned by `compute_optimal_lags`. If None, this will be
         recomputed by calling compute_optimal_lags
-    remove_redundant : bool
-        Whether or not to remove redundant predictors (Default: True)
 
     Returns:
     -------
@@ -229,13 +208,15 @@ def compute_granger_causality(data, lag_range=(1, 20), folds=10, n_jobs=-1, pair
         Granger causality matrix of shape (neurons, neurons), where each entry represents
         the causality score from one neuron to another.
     """
+    if lags is None:
+        lags = []
     neurons, trials, time_steps = data.shape
     print(f'Data contains {neurons} neurons, {trials} trials, and {time_steps} time steps.')
 
     if pairwise_lags is None:
         pairwise_lags = compute_optimal_lags(
             data,
-            lag_range=lag_range,
+            lags=lags,
             folds=folds,
             n_jobs=n_jobs
         )
@@ -245,7 +226,7 @@ def compute_granger_causality(data, lag_range=(1, 20), folds=10, n_jobs=-1, pair
 
     # Parallel computation for each source-target pair
     gc_results = Parallel(n_jobs=n_jobs)(
-        delayed(compute_gc_for_pair)(data, source, target, pairwise_lags[(source, target)][0], remove_redundant=remove_redundant)
+        delayed(compute_gc_for_pair)(data, source, target, pairwise_lags[(source, target)][0])
         for target in range(neurons)
         for source in range(neurons)
     )
@@ -376,7 +357,7 @@ def permutation_test(pairwise_lags, gc_matrix, signed_gc_matrix, data, n_permuta
     neurons = data.shape[0]
     permuted_gc_matrices = np.zeros((n_permutations, neurons, neurons))
 
-    def compute_permuted_gc(source, target, lag, perm_idx):
+    def compute_permuted_gc(source, target, lag):
         """
         Compute permuted GC for a specific source-target pair by shuffling the source spikes.
 
@@ -412,7 +393,7 @@ def permutation_test(pairwise_lags, gc_matrix, signed_gc_matrix, data, n_permuta
         for source in range(neurons):
             lag = pairwise_lags[(source, target)][0]
             permuted_gc_values = Parallel(n_jobs=n_jobs)(
-                delayed(compute_permuted_gc)(source, target, lag, perm)
+                delayed(compute_permuted_gc)(source, target, lag)
                 for perm in range(n_permutations)
             )
             permuted_gc_matrices[:, source, target] = permuted_gc_values
@@ -434,4 +415,3 @@ def permutation_test(pairwise_lags, gc_matrix, signed_gc_matrix, data, n_permuta
     significant_gc_matrix = np.where(corrected_p_values < alpha, signed_gc_matrix, 0)
 
     return significant_gc_matrix, corrected_p_values, permuted_gc_matrices
-
