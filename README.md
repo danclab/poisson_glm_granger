@@ -1,13 +1,30 @@
-# Poisson GLM Granger
-Python implementation and adaptation of Poisson GLM Granger causality
-from Kim et al. (2011) A Granger Causality Measure for Point Process 
-Models of Ensemble Neural Spiking Activity
+# GLM Granger
 
-<https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1001110>
+Python implementation and generalization of Granger causality for spike train data using Generalized Linear Models (GLMs), adapted from:
 
-Here the optimal lag is determined via cross-validation, redundant predictors are
-(optionally) removed based on VIF, indirect connections are filtered out, and 
-permutation tests are used to assess significance
+> Kim et al. (2011).  
+> A Granger Causality Measure for Point Process Models of Ensemble Neural Spiking Activity  
+> [PLOS Comput Biol, 7(3):e1001110](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1001110)
 
-## Requirements
-python version: scikit-learn, joblib, numpy, statsmodels (>=0.14.2)
+## Features
+
+- Supports any `statsmodels` GLM family (e.g. Poisson, Negative Binomial, Binomial)
+- Optimal lag selection via K-fold cross-validation
+- Optional filtering of indirect connections via causal pathway analysis
+- Permutation-based significance testing with FDR correction
+- Parallelized computation with `joblib`
+
+## Installation
+
+This package depends on:
+
+- Python 3.8+
+- `scikit-learn`
+- `joblib`
+- `numpy`
+- `statsmodels >= 0.14.2`
+
+You can install the required packages using:
+
+```bash
+pip install scikit-learn joblib numpy statsmodels
